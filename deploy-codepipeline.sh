@@ -4,7 +4,8 @@ setopt aliases
 
 alias aws-cf='aws cloudformation --profile awsbootstrap'
 STACK_NAME=example-codepipeline-01
-CODE_DEPLOY_SERVICE_ROLE_ARN=arn:aws:iam::521614954326:role/example-ec2-codedeploy-01-CodeDeployRole-1DW431FMGMNS2
+[[ -z "$2" ]] && echo "Must provide CodeDeployServiceRole.Arn" && exit 1
+CODE_DEPLOY_SERVICE_ROLE_ARN=$2
 
 if [ $1 = 'create' ] || [ $1 = 'update' ]; then
 aws-cf ${1}-stack \
