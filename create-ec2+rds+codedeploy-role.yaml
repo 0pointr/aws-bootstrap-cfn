@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Create a ec2+rds stack, setup roles for ec2 and codedeploy"
+
+Parameters:
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: "The ID of the AMI."
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  KeyPairName:
+    Type: String
+    Description: The name of an existing Amazon EC2 key pair in this region to use to SSH into the Amazon EC2 instances.
+  
+  DBInstanceIdentifier:
+    Type: String
+    Default: "webapp-db"
+  DBUsername:
+    NoEcho: "true"
+    Description: Username for Postgresql database access
+    Type: String
+    MinLength: "1"
+    MaxLength: "16"
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters.
+    Default: "postgres"
+  DBPassword:
+    NoEcho: "true"
+    Description: Password Postgresql database access
+    Type: String
+    MinLength: "8"
+    MaxLength: "41"
+    AllowedPattern: "[a-zA-Z0-9]*"
+    ConstraintDescription: Must contain only alphanumeric characters.
+  
+  TagKey:
+    Type: String
+    Description: The EC2 Tag key to target an instance for deployments
+    AllowedPattern: '[a-zA-Z0-9]+'
+    Default: CodeDeployTag
+  TagValue:
+    Type: String
+    Description: The EC2 Tag value to target an instance for deployments
+    AllowedPattern: '[a-zA-Z0-9]+'
+    Default: CodeDeployDemo
+
+Mappings:
+  EnvironmentToInstanceType:
+    dev:
+      InstanceType: t2.micro
+    test:
+      InstanceType: t2.micro
+    prod:
+      InstanceType: t2.micro
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service:
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+  
+  InstanceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: InstanceRolePolicy
+      Roles:
+       - !Ref InstanceRole
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - autoscaling:Describe*
+              - cloudformation:Describe*
+              - cloudformation:GetTemplate
+              - s3:Get*
+            Resource: '*'
+  
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - codedeploy.us-east-1.amazonaws.com
+                - codedeploy.us-west-2.amazonaws.com
+            Action: sts:AssumeRole
+
+  CodeDeployRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeDeployPolicy
+      Roles:
+       - !Ref CodeDeployRole
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Resource: '*'
+            Action:
+              - autoscaling:CompleteLifecycleAction
+              - autoscaling:DeleteLifecycleHook
+              - autoscaling:DescribeLifecycleHooks
+              - autoscaling:DescribeAutoScalingGroups
+              - autoscaling:PutLifecycleHook
+              - autoscaling:RecordLifecycleActionHeartbeat
+          - Effect: Allow
+            Resource: '*'
+            Action:
+              - ec2:Describe*
+
+  InstanceRoleInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+  
+  WebAppInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+        ResourceSignal:
+          Timeout: PT15M
+          Count: 1
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          services:
+            sysvinit:
+              codedeploy-agent:
+                enabled: 'true'
+                ensureRunning: 'true'
+          packages:
+            yum:
+              curl: []
+              unzip: []
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      ImageId: !Ref AmiId
+      InstanceType: !FindInMap [
+        EnvironmentToInstanceType,
+        !Ref Environment,
+        InstanceType
+      ]
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref WebAppSecurityGroup
+      IamInstanceProfile: !Ref InstanceRoleInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > /tmp/userdata.log 2>&1
+          
+          yum update -y aws-cfn-bootstrap
+          yum install -y aws-cli
+          yum install -y ruby
+          function error_exit {
+            /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource WebAppInstance -r "$1"
+            exit 1
+          }
+
+          cd /home/ec2-user
+          aws s3 cp 's3://aws-codedeploy-us-east-1/latest/codedeploy-agent.noarch.rpm' .
+          yum -y install codedeploy-agent.noarch.rpm || error_exit 'Failed to install AWS CodeDeploy Agent.'
+
+          /opt/aws/bin/cfn-init --stack ${AWS::StackName} --region ${AWS::Region} --resource WebAppInstance || \
+          error_exit 'Failed to run cfn-init'
+
+          /opt/aws/bin/cfn-signal -e 0 -r 'Setup complete' --stack ${AWS::StackName} --region ${AWS::Region} --resource WebAppInstance
+      Tags:
+        - Key: Stack
+          Value: !Ref AWS::StackName
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  
+  WebAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Join [ '-', ['webapp-security-group', !Ref Environment] ]
+      GroupDescription: 'allow http/s in/out, ssh'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  WebAppEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref WebAppInstance
+      Tags:
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  WebAppDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: '5'
+      DBInstanceClass: db.t3.micro
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      Engine: postgres
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !GetAtt EC2ToDBSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Join ['-', [webapp-rds, !Ref Environment]]
+        - Key: Stack
+          Value: !Ref AWS::StackName
+    DeletionPolicy: Delete
+
+  EC2ToDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Join [ '-', ['web-app-db-security-group', !Ref Environment]]
+      GroupDescription: Allow postgres inboud
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupName:
+            Ref: WebAppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', ['web-app-db-security-group', !Ref Environment]]
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+Outputs:
+  WebAppURL:
+    Description: Instance EIP
+    Value: !Sub http://${WebAppEIP}
+  
+  InstancePublicDNS:
+    Description: WebApp Instance pub dns
+    Value: !GetAtt WebAppInstance.PublicDnsName
+  
+  DBEndpoint:
+    Description: DB instance pub dns
+    Value: !GetAtt WebAppDBInstance.Endpoint.Address
+  
+  CodeDeployTrustRoleARN:
+    Description: CodeDeploy Role Arn
+    Value: !GetAtt CodeDeployRole.Arn

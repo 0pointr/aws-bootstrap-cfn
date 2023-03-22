@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Setup a CodePipeline with CloudFormation
+
+Parameters:
+  GitHubRepo:
+    Type: String
+
+  GitHubBranch:
+    Type: String
+    Default: main
+
+  GitHubUser:
+    Type: String
+
+  CodeDeployServiceRoleArn:
+    Type: String
+    Description: A service role ARN granting CodeDeploy permission to make calls to EC2 instances with CodeDeploy agent installed.
+
+  TagKey:
+    Description: The EC2 tag key that identifies this as a target for deployments.
+    Type: String
+    Default: CodeDeployTag
+    AllowedPattern: '[a-zA-Z0-9_]*'
+    ConstraintDescription: alphabets, characters, _.
+  TagValue:
+    Description: The EC2 tag value that identifies this as a target for deployments.
+    Type: String
+    Default: CodeDeployDemo
+    AllowedPattern: '[a-zA-Z0-9_]*'
+    ConstraintDescription: alphabets, characters, _.
+
+Resources:
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "logs"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                - Effect: "Allow"
+                  Action:
+                      - logs:CreateLogGroup
+                      - logs:CreateLogStream
+                      - logs:PutLogEvents
+                      - ecr:GetAuthorizationToken
+                      - ssm:GetParameters
+                  Resource: "*"
+        - PolicyName: "S3"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                - Effect: "Allow"
+                  Action:
+                      - s3:GetObject
+                      - s3:PutObject
+                      - s3:GetObjectVersion
+                  Resource: !Sub arn:aws:s3:::${ArtifactBucket}/*
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource:
+                  - !Sub arn:aws:s3:::${ArtifactBucket}/*
+                  - !Sub arn:aws:s3:::${ArtifactBucket}
+                Effect: Allow
+                Action:
+                  - s3:*
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
+              - Resource:
+                  - !Ref CodeStarConnection
+                Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:CreateDeploymentGroup
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+    
+  CodeStarConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: CfnExamplesGitHubConnection
+      ProviderType: GitHub
+  
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "demo-codepipeline-bucket-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+      Name: !Ref AWS::StackName
+      ServiceRole: !Ref CodeBuildServiceRole
+  
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "${AWS::StackName}-app"
+
+  CodeDeployGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      DeploymentGroupName: staging
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      Ec2TagFilters:
+        - Key: !Ref 'TagKey'
+          Value: !Ref 'TagValue'
+          Type: KEY_AND_VALUE
+      ServiceRoleArn: !Ref 'CodeDeployServiceRoleArn'
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: demo-app-code-pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages: 
+        - Name: Source-App
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: 1
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnection
+                BranchName: !Ref GitHubBranch
+                FullRepositoryId: !Sub ${GitHubUser}/${GitHubRepo}
+              OutputArtifacts:
+                - Name: AppArtifact
+              RunOrder: 1
+        - Name: Build-App
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Version: 1
+                Owner: AWS
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject  
+              InputArtifacts:
+                - Name: AppArtifact
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+        - Name: Deploy-App
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployGroup
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 3
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
